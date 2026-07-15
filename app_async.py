@@ -1,9 +1,12 @@
-"""ASGI app served by uvicorn.
+"""Django ASGI app served by uvicorn workers.
 
-Two endpoints simulating a 100 ms IO call (database query, HTTP request, ...):
+Three endpoints simulating a 100 ms IO call (database query, HTTP request, ...):
 
-- /blocking      uses time.sleep()    -> blocks the event loop
-- /non-blocking  uses asyncio.sleep() -> yields control to the event loop
+- /blocking           async view + time.sleep()    -> blocks the event loop
+- /non-blocking       async view + asyncio.sleep() -> yields to the event loop
+- /blocking-sync-view SYNC view + time.sleep()     -> Django wraps each request
+                      in its own ThreadSensitiveContext, so every in-flight
+                      request gets its own thread: blocking is absorbed.
 
 Run (mirrors prod config):
     uv run gunicorn app_async:app \
@@ -18,25 +21,51 @@ Run (mirrors prod config):
 import asyncio
 import time
 
-from fastapi import FastAPI
+from django.conf import settings
+from django.http import HttpRequest, JsonResponse
+from django.urls import path
 
 IO_DURATION = 0.1  # seconds, simulated IO latency
 
-app = FastAPI()
+settings.configure(
+    DEBUG=False,
+    SECRET_KEY="bench-only",
+    ALLOWED_HOSTS=["*"],
+    ROOT_URLCONF=__name__,
+)
 
 
-@app.get("/blocking")
-async def blocking() -> dict:
-    # Simulates blocking IO inside an async handler, e.g. requests.get(),
-    # psycopg2 queries, boto3 calls. The entire event loop is frozen for
-    # the duration - no other request makes progress.
+async def blocking(request: HttpRequest) -> JsonResponse:
+    # Simulates blocking IO inside an async view, e.g. requests.get(),
+    # psycopg2 queries, boto3 calls, or the sync Django ORM. The entire
+    # event loop is frozen for the duration - no other request progresses.
     time.sleep(IO_DURATION)
-    return {"io": "blocking"}
+    return JsonResponse({"io": "blocking"})
 
 
-@app.get("/non-blocking")
-async def non_blocking() -> dict:
-    # Simulates proper async IO, e.g. httpx.AsyncClient, asyncpg.
-    # The event loop is free to serve other requests while waiting.
+async def non_blocking(request: HttpRequest) -> JsonResponse:
+    # Simulates proper async IO, e.g. httpx.AsyncClient, the async ORM
+    # on an async-capable backend. The event loop stays free.
     await asyncio.sleep(IO_DURATION)
-    return {"io": "non-blocking"}
+    return JsonResponse({"io": "non-blocking"})
+
+
+def blocking_sync_view(request: HttpRequest) -> JsonResponse:
+    # Same blocking call in a plain sync view. Django's ASGI handler runs
+    # each request in its own ThreadSensitiveContext (one thread per
+    # in-flight request), so blocking here does NOT stall other requests -
+    # at the cost of one OS thread per concurrent request.
+    time.sleep(IO_DURATION)
+    return JsonResponse({"io": "blocking-sync-view"})
+
+
+urlpatterns = [
+    path("blocking", blocking),
+    path("non-blocking", non_blocking),
+    path("blocking-sync-view", blocking_sync_view),
+]
+
+# Imported lazily so settings.configure() above runs first.
+from django.core.asgi import get_asgi_application  # noqa: E402
+
+app = get_asgi_application()

@@ -1,18 +1,22 @@
 #!/usr/bin/env bash
-# Demo: blocking IO in an async stack (uvicorn workers) removes all benefit
-# of async.
+# Demo: blocking IO in an async Django stack (uvicorn workers) removes all
+# benefit of async.
 #
-# Both servers run with the SAME prod-style gunicorn config (3 workers,
-# --preload, --timeout 120); the only difference is the worker class.
-# Three scenarios, each hammered with wrk (50 connections, 10s):
+# Both servers run the SAME Django app style with the SAME prod-style gunicorn
+# config (3 workers, --preload, --timeout 120); the only difference is the
+# worker class. Four scenarios, each hammered with wrk (50 connections, 10s):
 #
-#   1. UvicornWorker, async handler, time.sleep(0.1)    -> ~30 req/s
-#   2. UvicornWorker, async handler, asyncio.sleep(0.1) -> ~500 req/s
-#   3. sync worker,   sync handler,  time.sleep(0.1)    -> ~30 req/s
+#   1. UvicornWorker, async view, time.sleep(0.1)    -> ~20 req/s
+#   2. UvicornWorker, async view, asyncio.sleep(0.1) -> ~200 req/s
+#   3. UvicornWorker, SYNC view,  time.sleep(0.1)    -> ~400 req/s
+#      (Django runs each request in its own ThreadSensitiveContext:
+#       one thread per in-flight request absorbs the blocking call)
+#   4. sync worker,   sync view,  time.sleep(0.1)    -> ~30 req/s
 #
-# Conclusion: with blocking IO, the async stack (1) performs exactly like
-# plain sync workers (3) - zero benefit. Only truly non-blocking IO (2)
-# delivers what async promises.
+# Conclusion: blocking IO inside an ASYNC view (1) freezes the event loop and
+# performs no better than plain sync workers (4). A plain sync view (3) is
+# safe under ASGI because Django gives it a thread per request. Only truly
+# non-blocking IO (2) or sync views (3) deliver concurrency on ASGI.
 
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -64,10 +68,12 @@ uv run gunicorn app_async:app \
 ASGI_PID=$!
 wait_ready "http://127.0.0.1:$ASGI_PORT/non-blocking"
 
-bench "async stack + BLOCKING IO (time.sleep in async def)" \
+bench "ASGI + async view + BLOCKING IO (time.sleep)" \
     "http://127.0.0.1:$ASGI_PORT/blocking"
-bench "async stack + proper async IO (asyncio.sleep)" \
+bench "ASGI + async view + proper async IO (asyncio.sleep)" \
     "http://127.0.0.1:$ASGI_PORT/non-blocking"
+bench "ASGI + SYNC view + BLOCKING IO (thread per request)" \
+    "http://127.0.0.1:$ASGI_PORT/blocking-sync-view"
 
 kill $ASGI_PID
 wait $ASGI_PID 2> /dev/null || true
@@ -84,7 +90,7 @@ uv run gunicorn app_sync:app \
 WSGI_PID=$!
 wait_ready "http://127.0.0.1:$WSGI_PORT/blocking"
 
-bench "sync stack + BLOCKING IO (time.sleep, 3 sync workers)" \
+bench "WSGI + sync view + BLOCKING IO (3 sync workers)" \
     "http://127.0.0.1:$WSGI_PORT/blocking"
 
 kill $WSGI_PID
@@ -93,10 +99,13 @@ wait $WSGI_PID 2> /dev/null || true
 echo
 echo "==================== SUMMARY ===================="
 for i in "${!NAMES[@]}"; do
-    printf "%-55s %10s req/s\n" "${NAMES[$i]}" "${RESULTS[$i]}"
+    printf "%-58s %10s req/s\n" "${NAMES[$i]}" "${RESULTS[$i]}"
 done
 echo "================================================="
-echo "Every request 'waits on IO' for 100 ms. With blocking calls, each"
-echo "uvicorn worker degrades to strictly serial execution: 3 workers ="
-echo "~30 req/s, identical to 3 plain sync workers. The async stack buys"
-echo "nothing unless the IO is actually non-blocking."
+echo "Every request 'waits on IO' for 100 ms. A blocking call inside an"
+echo "ASYNC view freezes the whole event loop: 3 uvicorn workers degrade"
+echo "to serial execution, no better than 3 plain sync workers. The same"
+echo "blocking call in a plain SYNC view is fine - Django gives each"
+echo "request its own thread under ASGI. On ASGI, either await real async"
+echo "IO or keep views sync; blocking inside 'async def' is the one fatal"
+echo "combination."
